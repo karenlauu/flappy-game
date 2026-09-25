@@ -26,22 +26,12 @@ A browser-based retro endless scroller game inspired by Flappy Bird. Guide Kiro 
 - 📱 Works on desktop and mobile
 - ☁️ Parallax scrolling clouds
 
-## Run Locally
-
-No build step needed — just open the file:
-
-```bash
-git clone https://github.com/karenlauu/flappy-game.git
-cd flappy-game
-open kiro-introduction-starter-kit/index.html
-```
-
 ## Built With
 
 - Vanilla HTML5, CSS, and JavaScript
 - HTML5 Canvas API for rendering
 - Web Audio API for sound effects
-- AWS CDK + Amplify for cloud hosting (see `infra/`)
+- Navigated with Kiro AI to code 
 
 ## Project Structure
 
@@ -53,7 +43,6 @@ open kiro-introduction-starter-kit/index.html
 │       ├── ghosty.png                  # Kiro sprite
 │       ├── jump.wav                    # Flap sound
 │       └── game_over.wav              # Game over sound
-└── infra/                              # AWS CDK infrastructure
 ```
 
 ## License
