@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flappy Kiro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #1a1a2e;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      max-width: 100vw;
+      max-height: 100vh;
+      aspect-ratio: 480 / 640;
+      /* Prevent tap highlight on mobile */
+      -webkit-tap-highlight-color: transparent;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="480" height="640"></canvas>
+
+  <script>
+    // ─── Browser Support Check ────────────────────────────────────────────────
+    const canvas = document.getElementById('gameCanvas');
+    if (!canvas.getContext) {
+      document.body.innerHTML = '<p style="color:white;font-family:sans-serif;padding:2rem;">Your browser does not support HTML5 Canvas. Please use a modern browser.</p>';
+      throw new Error('Canvas not supported');
+    }
+    const ctx = canvas.getContext('2d');
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+
+    // Canvas
+    const CANVAS_W = 480;
+    const CANVAS_H = 640;
+
+    // Physics
+    const GRAVITY = 0.5;          // px/frame² added to vy each frame
+    const FLAP_VELOCITY = -9;     // px/frame (negative = upward)
+    const MAX_FALL_VEL = 15;      // terminal velocity cap (px/frame)
+
+    // Pipes
+    const PIPE_SPEED = 3;         // px/frame (2–4 range)
+    const PIPE_WIDTH = 52;        // px (40–60 range)
+    const PIPE_CAP_EXTRA = 16;    // extra px each side for the cap
+    const PIPE_CAP_H = 12;        // height of the cap rectangle
+    const GAP_HEIGHT = 140;       // vertical gap between top and bottom pipe (120–160)
+    const GAP_MIN_Y = 60;         // min px from canvas edge to gap centre
+    const GAP_MAX_Y = CANVAS_H - 60; // max px from top to gap centre
+    const PIPE_SPACING = 220;     // px centre-to-centre between pipe pairs
+
+    // Clouds
+    const CLOUD_SPEED = PIPE_SPEED * 0.5; // parallax: half of pipe speed
+
+    // HUD
+    const HUD_HEIGHT = 36;        // px
+
+    // Sprite
+    const GHOST_W = 48;           // sprite render width (px)
+    const GHOST_H = 48;           // sprite render height (px)
+
+    // Assets — path relative to index.html's own location
+    const ASSET_BASE = 'assets/';
+
+    // ─── Game State ───────────────────────────────────────────────────────────
+    let gameState = 'START'; // 'START' | 'PLAYING' | 'GAME_OVER'
+
+    // ─── InputHandler ─────────────────────────────────────────────────────────
+    // Converts raw browser events into a single flapPending flag.
+    // Only the game loop consumes this flag via consumeFlap().
+    const InputHandler = (() => {
+      let flapPending = false;
+
+      function setPending() {
+        flapPending = true;
+      }
+
+      // Keydown: Space bar
+      document.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          e.preventDefault(); // prevent page scroll
+          setPending();
+        }
+      });
+
+      // Mouse click on canvas
+      canvas.addEventListener('click', () => {
+        setPending();
+      });
+
+      // Touch on canvas (passive: false so preventDefault works)
+      canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault(); // suppress scroll / zoom
+        setPending();
+      }, { passive: false });
+
+      return {
+        // Returns true once per gesture, then resets the flag.
+        consumeFlap() {
+          const val = flapPending;
+          flapPending = false;
+          return val;
+        },
+      };
+    })();
+
+    // ─── Shared Utility ───────────────────────────────────────────────────────
+    // Random integer in [min, max] inclusive.
+    function randInt(min, max) {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
+
+    // ─── PhysicsEngine ────────────────────────────────────────────────────────
+    // Owns Kiro's position and velocity. Pure logic — no DOM, no canvas.
+    // Kiro's x is fixed at 25% of canvas width; only y and vy change.
+    const PhysicsEngine = (() => {
+      const kiro = {
+        x: CANVAS_W * 0.25,  // fixed horizontal position
+        y: CANVAS_H / 2,     // vertical centre (reset on each new game)
+        vy: 0,               // vertical velocity (negative = upward)
+      };
+
+      return {
+        kiro,
+
+        // Restore Kiro to start-of-game position.
+        reset() {
+          kiro.y = CANVAS_H / 2;
+          kiro.vy = 0;
+        },
+
+        // Apply an upward impulse — identical every flap.
+        flap() {
+          kiro.vy = FLAP_VELOCITY;
+        },
+
+        // Advance physics one frame.
+        // Boundary enforcement is left to CollisionDetector — do NOT clamp here.
+        update() {
+          kiro.vy += GRAVITY;
+          kiro.y  += kiro.vy;
+        },
+      };
+    })();
+
+    // ─── PipeManager ──────────────────────────────────────────────────────────
+    // Generates, scrolls, and recycles pipe pairs. Pure logic — no canvas.
+    // Each PipePair: { x, gapCentreY, scored }
+    //   x          — left edge of the pipe column
+    //   gapCentreY — vertical centre of the gap between top and bottom pipe
+    //   scored     — true once Kiro has cleared this pair (prevents double-count)
+    const PipeManager = (() => {
+      const pipes = [];
+
+      // Valid range for gap centre: must stay at least GAP_HEIGHT/2 + GAP_MIN_Y
+      // from each canvas edge so the gap never clips the boundary.
+      const GAP_CENTRE_MIN = GAP_MIN_Y + GAP_HEIGHT / 2;
+      const GAP_CENTRE_MAX = CANVAS_H - GAP_MIN_Y - GAP_HEIGHT / 2;
+
+      function randomGapY() {
+        return randInt(GAP_CENTRE_MIN, GAP_CENTRE_MAX);
+      }
+
+      // Place three pipe pairs: first visible on the right side, rest behind it.
+      function reset() {
+        pipes.length = 0;
+        const firstX = CANVAS_W - PIPE_WIDTH - 60;
+        pipes.push({ x: firstX,                    gapCentreY: randomGapY(), scored: false });
+        pipes.push({ x: firstX + PIPE_SPACING,     gapCentreY: randomGapY(), scored: false });
+        pipes.push({ x: firstX + PIPE_SPACING * 2, gapCentreY: randomGapY(), scored: false });
+      }
+
+      // Scroll all pipes left; recycle any that have exited the left edge.
+      function update() {
+        for (const p of pipes) {
+          p.x -= PIPE_SPEED;
+        }
+        for (const p of pipes) {
+          if (p.x + PIPE_WIDTH < 0) {
+            // Find the rightmost pipe to anchor the recycled position.
+            const maxX = Math.max(...pipes.map(q => q.x));
+            p.x = maxX + PIPE_SPACING;
+            p.gapCentreY = randomGapY();
+            p.scored = false;
+          }
+        }
+      }
+
+      // Derived rects — computed on read, never stored.
+      function getTopRect(p) {
+        return {
+          x: p.x,
+          y: 0,
+          w: PIPE_WIDTH,
+          h: p.gapCentreY - GAP_HEIGHT / 2,
+        };
+      }
+
+      function getBottomRect(p) {
+        const y = p.gapCentreY + GAP_HEIGHT / 2;
+        return {
+          x: p.x,
+          y,
+          w: PIPE_WIDTH,
+          h: CANVAS_H - y,
+        };
+      }
+
+      return {
+        pipes,
+        reset,
+        update,
+        getTopRect,
+        getBottomRect,
+      };
+    })();
+
+    // ─── CloudManager ─────────────────────────────────────────────────────────
+    // Scrolls 4 background clouds at CLOUD_SPEED (0.5× pipe speed) for parallax.
+    // Each cloud: { x, y, w, h }
+    const CloudManager = (() => {
+      const clouds = [];
+
+      // Random cloud width (60–120 px) and height (20–40 px).
+      function randomCloud(x) {
+        const w = randInt(60, 120);
+        const h = randInt(20, 40);
+        // Keep clouds in the upper 55% of the canvas so they never overlap pipes.
+        const y = randInt(20, Math.floor(CANVAS_H * 0.55));
+        return { x, y, w, h };
+      }
+
+      // Spread 4 clouds evenly across the canvas width on init.
+      function init() {
+        clouds.length = 0;
+        for (let i = 0; i < 4; i++) {
+          clouds.push(randomCloud(randInt(0, CANVAS_W)));
+        }
+      }
+
+      // Scroll left; wrap to the right edge when fully off screen.
+      function update() {
+        for (const c of clouds) {
+          c.x -= CLOUD_SPEED;
+          if (c.x + c.w < 0) {
+            c.x = CANVAS_W + c.w;
+            // Randomise size and y on wrap for variety.
+            const fresh = randomCloud(c.x);
+            c.y = fresh.y;
+            c.w = fresh.w;
+            c.h = fresh.h;
+          }
+        }
+      }
+
+      return {
+        clouds,
+        init,
+        update,
+      };
+    })();
+
+    // ─── CollisionDetector ────────────────────────────────────────────────────
+    // Pure function component — no state. Tests Kiro's hitbox against pipes,
+    // the floor, and the ceiling using AABB intersection.
+    const CollisionDetector = (() => {
+
+      // AABB overlap test. Returns true if rect a and rect b share interior area.
+      function aabbOverlap(a, b) {
+        return (
+          a.x         < b.x + b.w &&
+          a.x + a.w   > b.x       &&
+          a.y         < b.y + b.h &&
+          a.y + a.h   > b.y
+        );
+      }
+
+      // Kiro's hitbox is inset 4 px on every side from the sprite bounds.
+      // This gives slightly forgiving collision margins (standard Flappy Bird feel).
+      // Do NOT increase the inset — it will make the game feel broken.
+      function getKiroHitbox(kiro) {
+        return {
+          x: kiro.x - GHOST_W / 2 + 4,
+          y: kiro.y - GHOST_H / 2 + 4,
+          w: GHOST_W - 8,
+          h: GHOST_H - 8,
+        };
+      }
+
+      return {
+        // Returns true if Kiro has hit a pipe, the floor, or the ceiling.
+        // Must be called after PhysicsEngine.update() and PipeManager.update()
+        // so it tests fully-resolved post-move positions.
+        check(kiro, pipes) {
+          const hb = getKiroHitbox(kiro);
+
+          // Floor: bottom edge of hitbox reaches the top of the HUD bar.
+          if (hb.y + hb.h >= CANVAS_H - HUD_HEIGHT) return true;
+
+          // Ceiling: top edge of hitbox reaches the top of the canvas.
+          if (hb.y <= 0) return true;
+
+          // Pipe AABB tests — return true on first hit found.
+          for (const p of pipes) {
+            if (aabbOverlap(hb, PipeManager.getTopRect(p)))    return true;
+            if (aabbOverlap(hb, PipeManager.getBottomRect(p))) return true;
+          }
+
+          return false;
+        },
+      };
+    })();
+
+    // ─── ScoreManager ─────────────────────────────────────────────────────────
+    // Tracks score and high score. Persists high score to localStorage.
+    // localStorage key: "flappyKiro_highScore"
+    const ScoreManager = (() => {
+      const LS_KEY = 'flappyKiro_highScore';
+      let score = 0;
+      let highScore = 0;
+
+      // Read high score from localStorage. Defaults to 0 on any invalid value.
+      function loadHighScore() {
+        const raw = localStorage.getItem(LS_KEY);
+        const val = parseInt(raw, 10);
+        highScore = (Number.isInteger(val) && val >= 0) ? val : 0;
+      }
+
+      // Persist current high score to localStorage.
+      function saveHighScore() {
+        localStorage.setItem(LS_KEY, String(highScore));
+      }
+
+      // Reset score to 0 for a new session; preserve high score.
+      function reset() {
+        score = 0;
+      }
+
+      // Check each pipe pair for a pipe-clear event and increment score.
+      // Also updates and persists high score if beaten.
+      // Must be called AFTER CollisionDetector.check() — no score on death frame.
+      function update(pipes, kiro) {
+        for (const p of pipes) {
+          if (!p.scored && kiro.x > p.x + PIPE_WIDTH) {
+            p.scored = true;
+            score++;
+            if (score > highScore) {
+              highScore = score;
+              saveHighScore();
+            }
+          }
+        }
+      }
+
+      return {
+        get score()     { return score; },
+        get highScore() { return highScore; },
+        loadHighScore,
+        saveHighScore,
+        reset,
+        update,
+      };
+    })();
+
+    // ─── AudioManager ─────────────────────────────────────────────────────────
+    // Loads and plays sound effects. All failures are silent — gameplay continues
+    // unaffected if an asset fails to load or the browser blocks autoplay.
+    const AudioManager = (() => {
+      let jumpAudio     = null;
+      let gameOverAudio = null;
+      let jumpFailed     = false;
+      let gameOverFailed = false;
+      // Set true on first playJump() call to unblock autoplay policy.
+      let userInteracted = false;
+
+      function init() {
+        jumpAudio = new Audio(ASSET_BASE + 'jump.wav');
+        jumpAudio.onerror = () => { jumpFailed = true; };
+
+        gameOverAudio = new Audio(ASSET_BASE + 'game_over.wav');
+        gameOverAudio.onerror = () => { gameOverFailed = true; };
+      }
+
+      function playJump() {
+        userInteracted = true;
+        if (jumpFailed || !jumpAudio) return;
+        jumpAudio.currentTime = 0;          // restart if already playing
+        jumpAudio.play().catch(() => {});    // silently swallow autoplay errors
+      }
+
+      function playGameOver() {
+        if (gameOverFailed || !gameOverAudio) return;
+        gameOverAudio.play().catch(() => {});
+      }
+
+      return { init, playJump, playGameOver };
+    })();
+
+    // ─── Renderer ─────────────────────────────────────────────────────────────
+    // Responsible for all canvas drawing. Called every frame regardless of state.
+    // Draw order: background → clouds → pipes → Kiro → HUD → overlay text.
+    const Renderer = (() => {
+      // Load ghost sprite once at module definition time.
+      const ghostSprite = new Image();
+      ghostSprite.src = ASSET_BASE + 'ghosty.png';
+
+      // ── Helpers ──────────────────────────────────────────────────────────────
+
+      function lerp(v, inMin, inMax, outMin, outMax) {
+        return outMin + (outMax - outMin) * ((v - inMin) / (inMax - inMin));
+      }
+
+      function clamp(v, lo, hi) {
+        return v < lo ? lo : v > hi ? hi : v;
+      }
+
+      // Map Kiro's vertical velocity to a tilt angle in radians.
+      // vy = FLAP_VELOCITY → −30° (nose up), vy = MAX_FALL_VEL → +90° (nose down).
+      function kiroAngle(vy) {
+        const raw = lerp(vy, FLAP_VELOCITY, MAX_FALL_VEL, -Math.PI / 6, Math.PI / 2);
+        return clamp(raw, -Math.PI / 6, Math.PI / 2);
+      }
+
+      // ── Draw steps ───────────────────────────────────────────────────────────
+
+      // Step 1: sky background (also acts as the full-canvas clear each frame).
+      function drawBackground() {
+        ctx.fillStyle = '#a8d8ea';
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+      }
+
+      // Step 2: parallax clouds.
+      function drawClouds(clouds) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+        for (const c of clouds) {
+          ctx.beginPath();
+          ctx.ellipse(
+            c.x + c.w / 2, c.y + c.h / 2,
+            c.w / 2, c.h / 2,
+            0, 0, Math.PI * 2
+          );
+          ctx.fill();
+        }
+      }
+
+      // Step 3: pipes — green body rectangles + darker cap at the open end.
+      function drawPipes(pipes) {
+        for (const p of pipes) {
+          const topH  = p.gapCentreY - GAP_HEIGHT / 2;
+          const botY  = p.gapCentreY + GAP_HEIGHT / 2;
+          const botH  = CANVAS_H - botY;
+          const capX  = p.x - PIPE_CAP_EXTRA;
+          const capW  = PIPE_WIDTH + PIPE_CAP_EXTRA * 2;
+
+          // Bodies
+          ctx.fillStyle = '#5aad3f';
+          ctx.fillRect(p.x, 0,    PIPE_WIDTH, topH);
+          ctx.fillRect(p.x, botY, PIPE_WIDTH, botH);
+
+          // Caps (darker green at the open end of each pipe)
+          ctx.fillStyle = '#3d8c2a';
+          ctx.fillRect(capX, topH - PIPE_CAP_H, capW, PIPE_CAP_H); // top pipe cap
+          ctx.fillRect(capX, botY,               capW, PIPE_CAP_H); // bottom pipe cap
+        }
+      }
+
+      // Step 4: Kiro sprite, rotated based on vertical velocity.
+      function drawKiro(kiro) {
+        const angle = kiroAngle(kiro.vy);
+        ctx.save();
+        ctx.translate(kiro.x, kiro.y);
+        ctx.rotate(angle);
+        ctx.drawImage(ghostSprite, -GHOST_W / 2, -GHOST_H / 2, GHOST_W, GHOST_H);
+        ctx.restore();
+      }
+
+      // Step 5: HUD bar — semi-transparent dark strip at bottom with score text.
+      function drawHUD(score, highScore) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        ctx.fillRect(0, CANVAS_H - HUD_HEIGHT, CANVAS_W, HUD_HEIGHT);
+
+        ctx.save();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 18px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(
+          `Score: ${score} | High: ${highScore}`,
+          CANVAS_W / 2,
+          CANVAS_H - HUD_HEIGHT / 2
+        );
+        ctx.restore();
+      }
+
+      // Step 6: overlay text for START and GAME_OVER states.
+      function drawOverlay(state) {
+        if (state === 'START') {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+          ctx.fillRect(0, 0, CANVAS_W, CANVAS_H - HUD_HEIGHT);
+
+          ctx.save();
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 28px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('Flappy Kiro', CANVAS_W / 2, CANVAS_H / 2 - 40);
+          ctx.font = '18px monospace';
+          ctx.fillText('Tap or press Space to Start', CANVAS_W / 2, CANVAS_H / 2 + 10);
+          ctx.restore();
+        }
+
+        if (state === 'GAME_OVER') {
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+          ctx.fillRect(0, 0, CANVAS_W, CANVAS_H - HUD_HEIGHT);
+
+          ctx.save();
+          ctx.fillStyle = '#ff4444';
+          ctx.font = 'bold 36px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('Game Over', CANVAS_W / 2, CANVAS_H / 2 - 40);
+          ctx.fillStyle = '#ffffff';
+          ctx.font = '18px monospace';
+          ctx.fillText('Tap or press Space to Restart', CANVAS_W / 2, CANVAS_H / 2 + 10);
+          ctx.restore();
+        }
+      }
+
+      // ── Public draw call ─────────────────────────────────────────────────────
+      return {
+        draw(state, kiro, pipes, clouds, score, highScore) {
+          drawBackground();                  // 1 — clears canvas
+          drawClouds(clouds);                // 2
+          drawPipes(pipes);                  // 3
+          drawKiro(kiro);                    // 4
+          drawHUD(score, highScore);         // 5
+          drawOverlay(state);                // 6 — always on top
+        },
+      };
+    })();
+
+    // ─── Game Loop & State Machine ────────────────────────────────────────────
+    // The loop runs continuously through all states via requestAnimationFrame.
+    // Only the update pipeline is gated by gameState — Renderer.draw() runs
+    // unconditionally every frame so all three screens are always rendered.
+    let rafId = null;
+
+    function gameLoop() {
+      // 1. Consume input once per frame, before any branching.
+      const flapped = InputHandler.consumeFlap();
+
+      // 2. State-gated update pipeline.
+      if (gameState === 'START') {
+        // Waiting for first flap to begin.
+        if (flapped) {
+          PhysicsEngine.flap();
+          AudioManager.playJump();
+          gameState = 'PLAYING';
+        }
+
+      } else if (gameState === 'PLAYING') {
+        // Active gameplay — run full update pipeline in the correct order.
+        if (flapped) {
+          PhysicsEngine.flap();
+          AudioManager.playJump();
+        }
+
+        // 2a. Advance physics and world.
+        PhysicsEngine.update();
+        PipeManager.update();
+        CloudManager.update();
+
+        // 2b. Collision check on post-move positions.
+        if (CollisionDetector.check(PhysicsEngine.kiro, PipeManager.pipes)) {
+          AudioManager.playGameOver();
+          ScoreManager.saveHighScore();
+          gameState = 'GAME_OVER';
+        } else {
+          // 2c. Score update only runs when there is no collision this frame.
+          ScoreManager.update(PipeManager.pipes, PhysicsEngine.kiro);
+        }
+
+      } else if (gameState === 'GAME_OVER') {
+        // Frozen — waiting for player to restart. Flap input restarts the game.
+        if (flapped) {
+          // Reset all stateful components before flipping state.
+          PhysicsEngine.reset();
+          PipeManager.reset();
+          ScoreManager.reset();
+          gameState = 'START';
+        }
+      }
+
+      // 3. Render unconditionally every frame.
+      Renderer.draw(
+        gameState,
+        PhysicsEngine.kiro,
+        PipeManager.pipes,
+        CloudManager.clouds,
+        ScoreManager.score,
+        ScoreManager.highScore
+      );
+
+      // 4. Schedule next frame.
+      rafId = requestAnimationFrame(gameLoop);
+    }
+
+    // Pause when the tab is hidden; resume when it comes back.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+      } else {
+        if (rafId === null) {
+          rafId = requestAnimationFrame(gameLoop);
+        }
+      }
+    });
+
+    // ─── Initialisation ───────────────────────────────────────────────────────
+    // Boot order: side-effectful modules first, then pure modules, then loop.
+    AudioManager.init();           // create Audio objects
+    CloudManager.init();           // spread initial clouds across canvas
+    PhysicsEngine.reset();         // Kiro at vertical centre, vy = 0
+    PipeManager.reset();           // two pipe pairs off right edge
+    ScoreManager.loadHighScore();  // read persisted high score from localStorage
+
+    // Kick off the game loop.
+    rafId = requestAnimationFrame(gameLoop);
+
+  </script>
+</body>
+</html>
