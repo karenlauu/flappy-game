@@ -13,10 +13,6 @@ A browser-based retro endless scroller game inspired by Flappy Bird. Guide Kiro 
 - Hitting a pipe, the floor, or the ceiling ends the game
 - Your high score is saved automatically between sessions
 
-## Screenshots
-
-![Flappy Kiro](kiro-introduction-starter-kit/img/example-ui.png)
-
 ## Features
 
 - 🎮 Single-file game — no install, no dependencies, opens in any browser
