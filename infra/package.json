@@ -1,0 +1,22 @@
+{
+  "name": "flappy-kiro-infra",
+  "version": "1.0.0",
+  "description": "CDK infrastructure for Flappy Kiro — CodeCommit + Amplify hosting",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "deploy": "npm run build && cdk deploy --require-approval never",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.147.3",
+    "constructs": "10.3.0"
+  },
+  "devDependencies": {
+    "aws-cdk": "2.147.3",
+    "typescript": "5.4.5",
+    "@types/node": "20.14.2"
+  }
+}
